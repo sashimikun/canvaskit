@@ -468,6 +468,11 @@ export default function Canvas() {
       const world = screenToWorld(sx, sy);
       const page = pages.find((p) => p.id === currentPageId);
 
+      // Update awareness
+      if (state.awareness) {
+        state.awareness.setLocalStateField("cursor", { x: world.x, y: world.y });
+      }
+
       // Update hover + cursor hints for resize/rotate zones
       if (interactionMode === "none" && page && state.activeTool === "SELECT") {
         const hitId = hitTest(world.x, world.y, nodes, page.children);

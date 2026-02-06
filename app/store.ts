@@ -1,5 +1,8 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
+import * as Y from "yjs";
+import { WebrtcProvider } from "y-webrtc";
+import { IndexeddbPersistence } from "y-indexeddb";
 import {
   DesignNode,
   SceneNode,
@@ -8,8 +11,8 @@ import {
   Camera,
   PageData,
   SmartGuide,
-  HistoryEntry,
 } from "./types";
+import randomColor from "randomcolor";
 
 function deepClone<T>(value: T): T {
   if (typeof structuredClone === "function") {
@@ -105,6 +108,12 @@ function createDefaultTextNode(overrides: Partial<TextNode> = {}): TextNode {
 }
 
 interface EditorState {
+  // Yjs
+  doc: Y.Doc | null;
+  provider: WebrtcProvider | null;
+  awareness: any | null;
+  undoManager: Y.UndoManager | null;
+
   // Document
   nodes: Map<string, DesignNode>;
   pages: PageData[];
@@ -128,15 +137,12 @@ interface EditorState {
   clipboard: DesignNode[];
   toasts: { id: string; message: string; timestamp: number }[];
 
-  // History
-  history: HistoryEntry[];
-  historyIndex: number;
-
   // Drawing state
   isDrawing: boolean;
   drawStart: { x: number; y: number } | null;
 
   // Actions
+  initialize: (roomId: string) => void;
   addNode: (node: DesignNode, parentId?: string) => void;
   updateNode: (id: string, updates: Partial<DesignNode>) => void;
   deleteNodes: (ids: string[]) => void;
@@ -192,8 +198,8 @@ interface EditorState {
   removeToast: (id: string) => void;
 
   // Persistence
-  exportDocument: () => string;
   importDocument: (json: string) => void;
+  exportDocument: () => string; // Keep export for manual file save
 
   // Get helpers
   getNode: (id: string) => DesignNode | undefined;
@@ -205,6 +211,11 @@ interface EditorState {
 const defaultPageId = nanoid();
 
 export const useEditorStore = create<EditorState>((set, get) => ({
+  doc: null,
+  provider: null,
+  awareness: null,
+  undoManager: null,
+
   nodes: new Map(),
   pages: [{ id: defaultPageId, name: "Page 1", children: [] }],
   currentPageId: defaultPageId,
@@ -222,93 +233,154 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   clipboard: [],
   toasts: [],
 
-  history: [],
-  historyIndex: -1,
-
   isDrawing: false,
   drawStart: null,
 
-  // Actions
-  addNode: (node, parentId) =>
-    set((state) => {
-      const newNodes = new Map(state.nodes);
-      const nextNode = {
-        ...node,
-        parentId: parentId ?? node.parentId ?? null,
-      } as DesignNode;
-      newNodes.set(nextNode.id, nextNode);
+  initialize: (roomId: string) => {
+    if (get().doc) return;
 
-      const newPages = [...state.pages];
-      if (parentId) {
-        const parent = newNodes.get(parentId);
-        if (parent) {
-          const updatedParent = {
-            ...parent,
-            children: [...parent.children, nextNode.id],
-          };
-          newNodes.set(parentId, updatedParent);
+    const doc = new Y.Doc({ guid: roomId });
+    const provider = new WebrtcProvider(roomId, doc, {
+        signaling: ['wss://y-webrtc-signaling-eu.herokuapp.com', 'wss://signaling.yjs.dev']
+    });
+    const persistence = new IndexeddbPersistence(roomId, doc);
+
+    const yNodes = doc.getMap<DesignNode>("nodes");
+    const yPages = doc.getArray<PageData>("pages");
+    const yMeta = doc.getMap<string>("meta");
+
+    const undoManager = new Y.UndoManager([yNodes, yPages], {
+        trackedOrigins: new Set([doc.clientID, null]), // Track local and non-tagged changes
+    });
+
+    persistence.on('synced', () => {
+        if (yPages.length === 0) {
+            doc.transact(() => {
+                 const defaultId = nanoid();
+                 yPages.push([{ id: defaultId, name: "Page 1", children: [] }]);
+            });
         }
-      } else {
-        const pageIdx = newPages.findIndex(
-          (p) => p.id === state.currentPageId
-        );
-        if (pageIdx >= 0) {
-          newPages[pageIdx] = {
-            ...newPages[pageIdx],
-            children: [...newPages[pageIdx].children, nextNode.id],
-          };
+        // Restore document name if empty
+        if (!yMeta.has("name")) {
+            yMeta.set("name", "Untitled");
         }
-      }
+    });
 
-      return { nodes: newNodes, pages: newPages };
-    }),
+    const updateState = () => {
+        const nodes = new Map<string, DesignNode>();
+        yNodes.forEach((v, k) => nodes.set(k, v));
 
-  updateNode: (id, updates) =>
-    set((state) => {
-      const node = state.nodes.get(id);
-      if (!node) return state;
-      const newNodes = new Map(state.nodes);
-      newNodes.set(id, { ...node, ...updates } as DesignNode);
-      return { nodes: newNodes };
-    }),
+        const pages = yPages.toArray();
+        const documentName = yMeta.get("name") || "Untitled";
 
-  deleteNodes: (ids) =>
-    set((state) => {
-      const newNodes = new Map(state.nodes);
-      const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
-      const newSelectedIds = new Set(state.selectedIds);
+        set((state) => {
+            // Ensure currentPageId is valid
+            let { currentPageId } = state;
+            if (pages.length > 0 && !pages.find(p => p.id === currentPageId)) {
+                currentPageId = pages[0].id;
+            }
+            return { nodes, pages, documentName, currentPageId };
+        });
+    };
 
-      const deleteRecursive = (nodeId: string) => {
-        const node = newNodes.get(nodeId);
-        if (!node) return;
-        for (const childId of node.children) {
-          deleteRecursive(childId);
-        }
-        newNodes.delete(nodeId);
-        newSelectedIds.delete(nodeId);
+    yNodes.observe(updateState);
+    yPages.observe(updateState);
+    yMeta.observe(updateState);
 
-        // Remove from parent
-        if (node.parentId) {
-          const parent = newNodes.get(node.parentId);
-          if (parent) {
-            newNodes.set(node.parentId, {
-              ...parent,
-              children: parent.children.filter((c) => c !== nodeId),
-            } as DesignNode);
-          }
+    updateState();
+
+    set({ doc, provider, awareness: provider.awareness, undoManager });
+  },
+
+  addNode: (node, parentId) => {
+    const { doc } = get();
+    if (!doc) return;
+
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const yPages = doc.getArray<PageData>("pages");
+
+        const nextNode = {
+            ...node,
+            parentId: parentId ?? node.parentId ?? null,
+        } as DesignNode;
+        yNodes.set(nextNode.id, nextNode);
+
+        if (parentId) {
+            const parent = yNodes.get(parentId);
+            if (parent) {
+                yNodes.set(parentId, { ...parent, children: [...parent.children, nextNode.id] });
+            }
         } else {
-          for (const page of newPages) {
-            page.children = page.children.filter((c) => c !== nodeId);
-          }
+            const state = get();
+            const pageIndex = yPages.toArray().findIndex(p => p.id === state.currentPageId);
+            if (pageIndex >= 0) {
+                const page = yPages.get(pageIndex);
+                const newPage = { ...page, children: [...page.children, nextNode.id] };
+                yPages.delete(pageIndex);
+                yPages.insert(pageIndex, [newPage]);
+            }
         }
-      };
+    });
+  },
 
-      for (const id of ids) {
-        deleteRecursive(id);
-      }
+  updateNode: (id, updates) => {
+    const { doc } = get();
+    if (!doc) return;
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const node = yNodes.get(id);
+        if (node) {
+            yNodes.set(id, { ...node, ...updates } as DesignNode);
+        }
+    });
+  },
 
-      return { nodes: newNodes, pages: newPages, selectedIds: newSelectedIds };
-    }),
+  deleteNodes: (ids) => {
+    const { doc } = get();
+    if (!doc) return;
+
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const yPages = doc.getArray<PageData>("pages");
+
+        const deleteRecursive = (nodeId: string) => {
+            const node = yNodes.get(nodeId);
+            if (!node) return;
+            for (const childId of node.children) {
+                deleteRecursive(childId);
+            }
+            yNodes.delete(nodeId);
+
+            // Remove from parent
+            if (node.parentId) {
+                const parent = yNodes.get(node.parentId);
+                if (parent) {
+                    yNodes.set(node.parentId, {
+                        ...parent,
+                        children: parent.children.filter(c => c !== nodeId)
+                    });
+                }
+            } else {
+                // Remove from pages
+                // This is inefficient O(N*M) but pages are few
+                for (let i = 0; i < yPages.length; i++) {
+                    const page = yPages.get(i);
+                    if (page.children.includes(nodeId)) {
+                        const newPage = { ...page, children: page.children.filter(c => c !== nodeId) };
+                        yPages.delete(i);
+                        yPages.insert(i, [newPage]);
+                    }
+                }
+            }
+        };
+
+        for (const id of ids) {
+            deleteRecursive(id);
+        }
+    });
+    set({ selectedIds: new Set() });
+  },
 
   setSelectedIds: (ids) => set({ selectedIds: ids }),
   toggleSelection: (id) =>
@@ -327,7 +399,13 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setSmartGuides: (guides) => set({ smartGuides: guides }),
   setIsDrawing: (drawing) => set({ isDrawing: drawing }),
   setDrawStart: (point) => set({ drawStart: point }),
-  setDocumentName: (name) => set({ documentName: name }),
+  setDocumentName: (name) => {
+      const { doc } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          doc.getMap<string>("meta").set("name", name);
+      });
+  },
 
   createShape: (type, x, y, width, height, overrides = {}) => {
     const fills: SceneNode["fills"] =
@@ -376,7 +454,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     });
 
     get().addNode(node);
-    get().pushHistory(`Create ${type.toLowerCase()}`);
+    // pushHistory handled by UndoManager
     return node.id;
   },
 
@@ -389,364 +467,368 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       ...overrides,
     });
     get().addNode(node);
-    get().pushHistory("Create text");
     return node.id;
   },
 
   duplicateNodes: (ids) => {
     const state = get();
-    const newIds: string[] = [];
-    const newNodes = new Map(state.nodes);
-    const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
+    const { doc } = state;
+    if (!doc) return;
 
-    for (const id of ids) {
-      const node = state.nodes.get(id);
-      if (!node) continue;
-      const newId = nanoid();
-      const dup = { ...node, id: newId, x: (node as SceneNode).x + 20, y: (node as SceneNode).y + 20 } as DesignNode;
-      newNodes.set(newId, dup);
-      newIds.push(newId);
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const yPages = doc.getArray<PageData>("pages");
+        const newIds: string[] = [];
 
-      if (node.parentId) {
-        const parent = newNodes.get(node.parentId);
-        if (parent) {
-          newNodes.set(node.parentId, {
-            ...parent,
-            children: [...parent.children, newId],
-          } as DesignNode);
+        for (const id of ids) {
+            const node = yNodes.get(id);
+            if (!node) continue;
+            const newId = nanoid();
+            const dup = { ...node, id: newId, x: (node as SceneNode).x + 20, y: (node as SceneNode).y + 20 } as DesignNode;
+            yNodes.set(newId, dup);
+            newIds.push(newId);
+
+            if (node.parentId) {
+                const parent = yNodes.get(node.parentId);
+                if (parent) {
+                    yNodes.set(node.parentId, { ...parent, children: [...parent.children, newId] });
+                }
+            } else {
+                 const pageIdx = yPages.toArray().findIndex(p => p.id === state.currentPageId);
+                 if (pageIdx >= 0) {
+                     const page = yPages.get(pageIdx);
+                     const newPage = { ...page, children: [...page.children, newId] };
+                     yPages.delete(pageIdx);
+                     yPages.insert(pageIdx, [newPage]);
+                 }
+            }
         }
-      } else {
-        const pageIdx = newPages.findIndex((p) => p.id === state.currentPageId);
-        if (pageIdx >= 0) {
-          newPages[pageIdx].children.push(newId);
-        }
-      }
-    }
-
-    set({
-      nodes: newNodes,
-      pages: newPages,
-      selectedIds: new Set(newIds),
+        set({ selectedIds: new Set(newIds) });
     });
-    get().pushHistory("Duplicate");
   },
 
   groupNodes: (ids) => {
-    if (ids.length < 2) return;
     const state = get();
-    const validIds = ids.filter((id) => state.nodes.has(id));
-    if (validIds.length < 2) return;
+    const { doc } = state;
+    if (!doc) return;
+    if (ids.length < 2) return;
 
-    const newNodes = new Map(state.nodes);
-    const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const yPages = doc.getArray<PageData>("pages");
 
-    const firstNode = state.nodes.get(validIds[0]) as SceneNode | undefined;
-    const parentId = firstNode?.parentId ?? null;
-    const parentWorld = getParentWorldPosition(parentId, state.nodes);
+        const validIds = ids.filter(id => yNodes.has(id));
+        if (validIds.length < 2) return;
 
-    const worldPositions = new Map<string, { x: number; y: number }>();
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const id of validIds) {
-      const n = state.nodes.get(id) as SceneNode;
-      if (!n) continue;
-      const worldPos = getWorldPosition(n, state.nodes);
-      worldPositions.set(id, worldPos);
-      minX = Math.min(minX, worldPos.x);
-      minY = Math.min(minY, worldPos.y);
-      maxX = Math.max(maxX, worldPos.x + n.width);
-      maxY = Math.max(maxY, worldPos.y + n.height);
-    }
-    if (!isFinite(minX) || !isFinite(minY)) return;
+        const firstNode = yNodes.get(validIds[0]) as SceneNode | undefined;
+        const parentId = firstNode?.parentId ?? null;
 
-    const group = createDefaultNode("GROUP", {
-      x: minX - parentWorld.x,
-      y: minY - parentWorld.y,
-      width: maxX - minX,
-      height: maxY - minY,
-      fills: [],
-      children: [...validIds],
-      parentId,
-    });
+        // Helper access current nodes from Yjs
+        const getNode = (id: string) => yNodes.get(id);
+        const getNodesMap = () => {
+             const m = new Map<string, DesignNode>();
+             yNodes.forEach((v, k) => m.set(k, v));
+             return m;
+        };
+        const currentNodesMap = getNodesMap(); // Snapshot for calculation
 
-    for (const id of validIds) {
-      const node = newNodes.get(id);
-      if (!node) continue;
+        const parentWorld = getParentWorldPosition(parentId, currentNodesMap);
 
-      if (node.parentId) {
-        const parent = newNodes.get(node.parentId);
-        if (parent) {
-          newNodes.set(node.parentId, {
-            ...parent,
-            children: parent.children.filter((c) => c !== id),
-          } as DesignNode);
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        const worldPositions = new Map<string, { x: number; y: number }>();
+
+        for (const id of validIds) {
+            const n = currentNodesMap.get(id) as SceneNode;
+            if (!n) continue;
+            const worldPos = getWorldPosition(n, currentNodesMap);
+            worldPositions.set(id, worldPos);
+            minX = Math.min(minX, worldPos.x);
+            minY = Math.min(minY, worldPos.y);
+            maxX = Math.max(maxX, worldPos.x + n.width);
+            maxY = Math.max(maxY, worldPos.y + n.height);
         }
-      } else {
-        for (const page of newPages) {
-          page.children = page.children.filter((c) => c !== id);
+
+        const group = createDefaultNode("GROUP", {
+            x: minX - parentWorld.x,
+            y: minY - parentWorld.y,
+            width: maxX - minX,
+            height: maxY - minY,
+            fills: [],
+            children: [...validIds],
+            parentId,
+        });
+
+        // Remove from old parents
+        for (const id of validIds) {
+            const node = yNodes.get(id);
+            if (!node) continue;
+            if (node.parentId) {
+                const parent = yNodes.get(node.parentId);
+                if (parent) {
+                    yNodes.set(node.parentId, { ...parent, children: parent.children.filter(c => c !== id) });
+                }
+            } else {
+                 for (let i = 0; i < yPages.length; i++) {
+                     const page = yPages.get(i);
+                     if (page.children.includes(id)) {
+                         const newPage = { ...page, children: page.children.filter(c => c !== id) };
+                         yPages.delete(i);
+                         yPages.insert(i, [newPage]);
+                     }
+                 }
+            }
         }
-      }
-    }
 
-    for (const id of validIds) {
-      const node = newNodes.get(id) as SceneNode | undefined;
-      const worldPos = worldPositions.get(id);
-      if (!node || !worldPos) continue;
-      newNodes.set(id, {
-        ...node,
-        parentId: group.id,
-        x: worldPos.x - minX,
-        y: worldPos.y - minY,
-      } as DesignNode);
-    }
+        // Update nodes with new parent and positions
+        for (const id of validIds) {
+             const node = yNodes.get(id) as SceneNode | undefined;
+             const worldPos = worldPositions.get(id);
+             if (!node || !worldPos) continue;
+             yNodes.set(id, {
+                 ...node,
+                 parentId: group.id,
+                 x: worldPos.x - minX,
+                 y: worldPos.y - minY
+             } as DesignNode);
+        }
 
-    newNodes.set(group.id, group as DesignNode);
+        // Add group
+        yNodes.set(group.id, group as DesignNode);
 
-    if (parentId) {
-      const parent = newNodes.get(parentId);
-      if (parent) {
-        newNodes.set(parentId, {
-          ...parent,
-          children: [...parent.children, group.id],
-        } as DesignNode);
-      }
-    } else {
-      const pageIdx = newPages.findIndex((p) => p.id === state.currentPageId);
-      if (pageIdx >= 0) {
-        newPages[pageIdx].children.push(group.id);
-      }
-    }
+        // Add group to parent
+        if (parentId) {
+            const parent = yNodes.get(parentId);
+            if (parent) {
+                yNodes.set(parentId, { ...parent, children: [...parent.children, group.id] });
+            }
+        } else {
+             const pageIdx = yPages.toArray().findIndex(p => p.id === state.currentPageId);
+             if (pageIdx >= 0) {
+                 const page = yPages.get(pageIdx);
+                 const newPage = { ...page, children: [...page.children, group.id] };
+                 yPages.delete(pageIdx);
+                 yPages.insert(pageIdx, [newPage]);
+             }
+        }
 
-    set({
-      nodes: newNodes,
-      pages: newPages,
-      selectedIds: new Set([group.id]),
+        set({ selectedIds: new Set([group.id]) });
     });
-    get().pushHistory("Group");
   },
 
   ungroupNodes: (ids) => {
     const state = get();
-    const newNodes = new Map(state.nodes);
-    const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
-    const newSelectedIds: string[] = [];
+    const { doc } = state;
+    if (!doc) return;
 
-    for (const id of ids) {
-      const node = newNodes.get(id) as SceneNode | undefined;
-      if (!node || node.type !== "GROUP") continue;
+    doc.transact(() => {
+        const yNodes = doc.getMap<DesignNode>("nodes");
+        const yPages = doc.getArray<PageData>("pages");
 
-      const groupWorld = getWorldPosition(node, newNodes);
-      const parentWorld = getParentWorldPosition(node.parentId, newNodes);
+        // Snapshot
+        const currentNodesMap = new Map<string, DesignNode>();
+        yNodes.forEach((v, k) => currentNodesMap.set(k, v));
 
-      if (node.parentId) {
-        const parent = newNodes.get(node.parentId);
-        if (parent) {
-          newNodes.set(node.parentId, {
-            ...parent,
-            children: parent.children.filter((c) => c !== id),
-          } as DesignNode);
+        const newSelectedIds: string[] = [];
+
+        for (const id of ids) {
+            const node = yNodes.get(id) as SceneNode | undefined;
+            if (!node || node.type !== "GROUP") continue;
+
+            const groupWorld = getWorldPosition(node, currentNodesMap);
+            const parentWorld = getParentWorldPosition(node.parentId, currentNodesMap);
+
+            // Remove group from parent
+            if (node.parentId) {
+                const parent = yNodes.get(node.parentId);
+                if (parent) {
+                    yNodes.set(node.parentId, { ...parent, children: parent.children.filter(c => c !== id) });
+                }
+            } else {
+                 for (let i = 0; i < yPages.length; i++) {
+                     const page = yPages.get(i);
+                     if (page.children.includes(id)) {
+                         const newPage = { ...page, children: page.children.filter(c => c !== id) };
+                         yPages.delete(i);
+                         yPages.insert(i, [newPage]);
+                     }
+                 }
+            }
+
+            // Move children out
+            for (const childId of node.children) {
+                const child = yNodes.get(childId) as SceneNode | undefined;
+                if (!child) continue;
+                const childWorld = {
+                    x: groupWorld.x + child.x,
+                    y: groupWorld.y + child.y
+                };
+
+                yNodes.set(childId, {
+                    ...child,
+                    parentId: node.parentId,
+                    x: childWorld.x - parentWorld.x,
+                    y: childWorld.y - parentWorld.y
+                } as DesignNode);
+                newSelectedIds.push(childId);
+            }
+
+            // Add children to parent
+            if (node.parentId) {
+                const parent = yNodes.get(node.parentId);
+                if (parent) {
+                    yNodes.set(node.parentId, { ...parent, children: [...parent.children, ...node.children] });
+                }
+            } else {
+                 const pageIdx = yPages.toArray().findIndex(p => p.id === state.currentPageId);
+                 if (pageIdx >= 0) {
+                     const page = yPages.get(pageIdx);
+                     const newPage = { ...page, children: [...page.children, ...node.children] };
+                     yPages.delete(pageIdx);
+                     yPages.insert(pageIdx, [newPage]);
+                 }
+            }
+
+            yNodes.delete(id);
         }
-      } else {
-        for (const page of newPages) {
-          page.children = page.children.filter((c) => c !== id);
-        }
-      }
-
-      for (const childId of node.children) {
-        const child = newNodes.get(childId) as SceneNode | undefined;
-        if (!child) continue;
-        const childWorld = {
-          x: groupWorld.x + child.x,
-          y: groupWorld.y + child.y,
-        };
-
-        newNodes.set(childId, {
-          ...child,
-          parentId: node.parentId,
-          x: childWorld.x - parentWorld.x,
-          y: childWorld.y - parentWorld.y,
-        } as DesignNode);
-        newSelectedIds.push(childId);
-      }
-
-      if (node.parentId) {
-        const parent = newNodes.get(node.parentId);
-        if (parent) {
-          newNodes.set(node.parentId, {
-            ...parent,
-            children: [...parent.children, ...node.children],
-          } as DesignNode);
-        }
-      } else {
-        const pageIdx = newPages.findIndex((p) => p.id === state.currentPageId);
-        if (pageIdx >= 0) {
-          newPages[pageIdx].children.push(...node.children);
-        }
-        for (const page of newPages) {
-          page.children = page.children.filter((c) => c !== id);
-        }
-      }
-      newNodes.delete(id);
-    }
-
-    set({
-      nodes: newNodes,
-      pages: newPages,
-      selectedIds: new Set(newSelectedIds),
+        set({ selectedIds: new Set(newSelectedIds) });
     });
-    get().pushHistory("Ungroup");
   },
 
-  moveNodes: (ids, dx, dy) =>
-    set((state) => {
-      const newNodes = new Map(state.nodes);
-      for (const id of ids) {
-        const node = newNodes.get(id) as SceneNode;
-        if (!node || node.locked) continue;
-        newNodes.set(id, { ...node, x: node.x + dx, y: node.y + dy } as DesignNode);
-      }
-      return { nodes: newNodes };
-    }),
+  moveNodes: (ids, dx, dy) => {
+      const { doc } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          const yNodes = doc.getMap<DesignNode>("nodes");
+          for (const id of ids) {
+              const node = yNodes.get(id) as SceneNode;
+              if (node && !node.locked) {
+                  yNodes.set(id, { ...node, x: node.x + dx, y: node.y + dy } as DesignNode);
+              }
+          }
+      });
+  },
 
   reorderNode: (id, newIndex, newParentId) => {
-    const state = get();
-    const node = state.nodes.get(id);
-    if (!node) return;
+      const { doc, currentPageId } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          const yNodes = doc.getMap<DesignNode>("nodes");
+          const yPages = doc.getArray<PageData>("pages");
 
-    const newNodes = new Map(state.nodes);
-    const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
+          const node = yNodes.get(id);
+          if (!node) return;
 
-    // Remove from old parent
-    if (node.parentId) {
-      const parent = newNodes.get(node.parentId);
-      if (parent) {
-        newNodes.set(node.parentId, {
-          ...parent,
-          children: parent.children.filter((c) => c !== id),
-        } as DesignNode);
-      }
-    } else {
-      for (const page of newPages) {
-        page.children = page.children.filter((c) => c !== id);
-      }
-    }
+          // Remove from old parent
+          if (node.parentId) {
+              const parent = yNodes.get(node.parentId);
+              if (parent) {
+                  yNodes.set(node.parentId, { ...parent, children: parent.children.filter(c => c !== id) });
+              }
+          } else {
+               for (let i = 0; i < yPages.length; i++) {
+                   const page = yPages.get(i);
+                   if (page.children.includes(id)) {
+                       const newPage = { ...page, children: page.children.filter(c => c !== id) };
+                       yPages.delete(i);
+                       yPages.insert(i, [newPage]);
+                   }
+               }
+          }
 
-    // Add to new parent
-    const targetParentId = newParentId ?? node.parentId;
-    if (targetParentId) {
-      const parent = newNodes.get(targetParentId);
-      if (parent) {
-        const children = [...parent.children];
-        children.splice(newIndex, 0, id);
-        newNodes.set(targetParentId, { ...parent, children } as DesignNode);
-      }
-    } else {
-      const pageIdx = newPages.findIndex((p) => p.id === state.currentPageId);
-      if (pageIdx >= 0) {
-        newPages[pageIdx].children.splice(newIndex, 0, id);
-      }
-    }
+          // Add to new parent
+          const targetParentId = newParentId ?? node.parentId;
+          if (targetParentId) {
+              const parent = yNodes.get(targetParentId);
+              if (parent) {
+                  const children = [...parent.children];
+                  children.splice(newIndex, 0, id);
+                  yNodes.set(targetParentId, { ...parent, children });
+              }
+          } else {
+               const pageIdx = yPages.toArray().findIndex(p => p.id === currentPageId);
+               if (pageIdx >= 0) {
+                   const page = yPages.get(pageIdx);
+                   const children = [...page.children];
+                   children.splice(newIndex, 0, id);
+                   const newPage = { ...page, children };
+                   yPages.delete(pageIdx);
+                   yPages.insert(pageIdx, [newPage]);
+               }
+          }
 
-    newNodes.set(id, { ...node, parentId: targetParentId ?? null } as DesignNode);
-    set({ nodes: newNodes, pages: newPages });
+          yNodes.set(id, { ...node, parentId: targetParentId ?? null } as DesignNode);
+      });
   },
 
   bringForward: (ids) => {
-    const state = get();
+    const { doc, currentPageId } = get();
+    if (!doc) return;
+    const yNodes = doc.getMap<DesignNode>("nodes");
+    const yPages = doc.getArray<PageData>("pages");
+
     for (const id of ids) {
-      const node = state.nodes.get(id);
-      if (!node) continue;
-      const siblings = node.parentId
-        ? state.nodes.get(node.parentId)?.children || []
-        : state.pages.find((p) => p.id === state.currentPageId)?.children || [];
-      const idx = siblings.indexOf(id);
-      if (idx < siblings.length - 1) {
-        get().reorderNode(id, idx + 1);
-      }
+        const node = yNodes.get(id);
+        if (!node) continue;
+        const siblings = node.parentId
+            ? yNodes.get(node.parentId)?.children || []
+            : yPages.toArray().find(p => p.id === currentPageId)?.children || [];
+        const idx = siblings.indexOf(id);
+        if (idx < siblings.length - 1) {
+            get().reorderNode(id, idx + 1);
+        }
     }
-    get().pushHistory("Bring forward");
   },
 
   sendBackward: (ids) => {
-    const state = get();
+    const { doc, currentPageId } = get();
+    if (!doc) return;
+    const yNodes = doc.getMap<DesignNode>("nodes");
+    const yPages = doc.getArray<PageData>("pages");
+
     for (const id of ids) {
-      const node = state.nodes.get(id);
-      if (!node) continue;
-      const siblings = node.parentId
-        ? state.nodes.get(node.parentId)?.children || []
-        : state.pages.find((p) => p.id === state.currentPageId)?.children || [];
-      const idx = siblings.indexOf(id);
-      if (idx > 0) {
-        get().reorderNode(id, idx - 1);
-      }
+        const node = yNodes.get(id);
+        if (!node) continue;
+        const siblings = node.parentId
+            ? yNodes.get(node.parentId)?.children || []
+            : yPages.toArray().find(p => p.id === currentPageId)?.children || [];
+        const idx = siblings.indexOf(id);
+        if (idx > 0) {
+            get().reorderNode(id, idx - 1);
+        }
     }
-    get().pushHistory("Send backward");
   },
 
   bringToFront: (ids) => {
-    const state = get();
+    const { doc, currentPageId } = get();
+    if (!doc) return;
+    const yNodes = doc.getMap<DesignNode>("nodes");
+    const yPages = doc.getArray<PageData>("pages");
+
     for (const id of ids) {
-      const node = state.nodes.get(id);
-      if (!node) continue;
-      const siblings = node.parentId
-        ? state.nodes.get(node.parentId)?.children || []
-        : state.pages.find((p) => p.id === state.currentPageId)?.children || [];
-      get().reorderNode(id, siblings.length - 1);
+        const node = yNodes.get(id);
+        if (!node) continue;
+        const siblings = node.parentId
+            ? yNodes.get(node.parentId)?.children || []
+            : yPages.toArray().find(p => p.id === currentPageId)?.children || [];
+        get().reorderNode(id, siblings.length - 1);
     }
-    get().pushHistory("Bring to front");
   },
 
   sendToBack: (ids) => {
     for (const id of ids) {
-      get().reorderNode(id, 0);
+        get().reorderNode(id, 0);
     }
-    get().pushHistory("Send to back");
   },
 
-  // History
-  pushHistory: (description) =>
-    set((state) => {
-      const clonedNodes = cloneNodesMap(state.nodes);
-      const entry: HistoryEntry = {
-        nodes: clonedNodes,
-        pages: deepClone(state.pages),
-        description,
-      };
-      const newHistory = state.history.slice(0, state.historyIndex + 1);
-      newHistory.push(entry);
-      if (newHistory.length > 100) newHistory.shift();
-      return { history: newHistory, historyIndex: newHistory.length - 1 };
-    }),
+  pushHistory: (description) => {
+      // Handled by Y.UndoManager automatically
+      // We might want to add a description to the transaction origin if needed,
+      // but standard undo/redo is sufficient for now.
+  },
 
-  undo: () =>
-    set((state) => {
-      if (state.historyIndex <= 0) return state;
-      const newIndex = state.historyIndex - 1;
-      const entry = state.history[newIndex];
-      return {
-        nodes: cloneNodesMap(entry.nodes),
-        pages: deepClone(entry.pages),
-        historyIndex: newIndex,
-        selectedIds: new Set(),
-      };
-    }),
+  undo: () => get().undoManager?.undo(),
+  redo: () => get().undoManager?.redo(),
 
-  redo: () =>
-    set((state) => {
-      if (state.historyIndex >= state.history.length - 1) return state;
-      const newIndex = state.historyIndex + 1;
-      const entry = state.history[newIndex];
-      return {
-        nodes: cloneNodesMap(entry.nodes),
-        pages: deepClone(entry.pages),
-        historyIndex: newIndex,
-        selectedIds: new Set(),
-      };
-    }),
-
-  // Clipboard
   copyNodes: () => {
     const state = get();
     const copied: DesignNode[] = [];
@@ -758,95 +840,109 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   pasteNodes: () => {
-    const state = get();
-    if (state.clipboard.length === 0) return;
-    const newIds: string[] = [];
-    const newNodes = new Map(state.nodes);
-    const newPages = state.pages.map((p) => ({ ...p, children: [...p.children] }));
+      const state = get();
+      if (state.clipboard.length === 0) return;
+      const { doc } = state;
+      if (!doc) return;
 
-    for (const node of state.clipboard) {
-      const newId = nanoid();
-      const dup = {
-        ...deepClone(node),
-        id: newId,
-        parentId: null,
-        x: (node as SceneNode).x + 20,
-        y: (node as SceneNode).y + 20,
-      } as DesignNode;
-      newNodes.set(newId, dup);
-      newIds.push(newId);
+      doc.transact(() => {
+          const yNodes = doc.getMap<DesignNode>("nodes");
+          const yPages = doc.getArray<PageData>("pages");
+          const newIds: string[] = [];
 
-      const pageIdx = newPages.findIndex((p) => p.id === state.currentPageId);
-      if (pageIdx >= 0) {
-        newPages[pageIdx].children.push(newId);
-      }
-    }
+          for (const node of state.clipboard) {
+              const newId = nanoid();
+              const dup = {
+                  ...deepClone(node),
+                  id: newId,
+                  parentId: null,
+                  x: (node as SceneNode).x + 20,
+                  y: (node as SceneNode).y + 20
+              } as DesignNode;
+              yNodes.set(newId, dup);
+              newIds.push(newId);
 
-    set({
-      nodes: newNodes,
-      pages: newPages,
-      selectedIds: new Set(newIds),
-    });
-    get().pushHistory("Paste");
+              const pageIdx = yPages.toArray().findIndex(p => p.id === state.currentPageId);
+              if (pageIdx >= 0) {
+                   const page = yPages.get(pageIdx);
+                   const newPage = { ...page, children: [...page.children, newId] };
+                   yPages.delete(pageIdx);
+                   yPages.insert(pageIdx, [newPage]);
+              }
+          }
+          set({ selectedIds: new Set(newIds) });
+      });
   },
 
-  // Pages
-  addPage: () =>
-    set((state) => {
-      const newPage: PageData = {
-        id: nanoid(),
-        name: `Page ${state.pages.length + 1}`,
-        children: [],
-      };
-      return {
-        pages: [...state.pages, newPage],
-        currentPageId: newPage.id,
-        selectedIds: new Set(),
-      };
-    }),
+  addPage: () => {
+      const { doc } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          const yPages = doc.getArray<PageData>("pages");
+          const newPage: PageData = {
+              id: nanoid(),
+              name: `Page ${yPages.length + 1}`,
+              children: []
+          };
+          yPages.push([newPage]);
+          set({ currentPageId: newPage.id, selectedIds: new Set() });
+      });
+  },
 
   setCurrentPage: (pageId) =>
     set({ currentPageId: pageId, selectedIds: new Set() }),
 
-  renamePage: (pageId, name) =>
-    set((state) => ({
-      pages: state.pages.map((p) =>
-        p.id === pageId ? { ...p, name } : p
-      ),
-    })),
+  renamePage: (pageId, name) => {
+      const { doc } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          const yPages = doc.getArray<PageData>("pages");
+          const idx = yPages.toArray().findIndex(p => p.id === pageId);
+          if (idx >= 0) {
+              const page = yPages.get(idx);
+              const newPage = { ...page, name };
+              yPages.delete(idx);
+              yPages.insert(idx, [newPage]);
+          }
+      });
+  },
 
-  deletePage: (pageId) =>
-    set((state) => {
-      if (state.pages.length <= 1) return state;
-      const page = state.pages.find((p) => p.id === pageId);
-      if (!page) return state;
+  deletePage: (pageId) => {
+      const { doc } = get();
+      if (!doc) return;
+      doc.transact(() => {
+          const yPages = doc.getArray<PageData>("pages");
+          const yNodes = doc.getMap<DesignNode>("nodes");
 
-      const newNodes = new Map(state.nodes);
-      const deleteRecursive = (nodeId: string) => {
-        const node = newNodes.get(nodeId);
-        if (!node) return;
-        for (const childId of node.children) {
-          deleteRecursive(childId);
-        }
-        newNodes.delete(nodeId);
-      };
-      for (const childId of page.children) {
-        deleteRecursive(childId);
-      }
+          if (yPages.length <= 1) return;
+          const idx = yPages.toArray().findIndex(p => p.id === pageId);
+          if (idx < 0) return;
 
-      const newPages = state.pages.filter((p) => p.id !== pageId);
-      const newCurrentPageId =
-        state.currentPageId === pageId ? newPages[0].id : state.currentPageId;
+          const page = yPages.get(idx);
 
-      return {
-        nodes: newNodes,
-        pages: newPages,
-        currentPageId: newCurrentPageId,
-        selectedIds: state.currentPageId === pageId ? new Set<string>() : state.selectedIds,
-      };
-    }),
+          // Delete children
+          const deleteRecursive = (nodeId: string) => {
+              const node = yNodes.get(nodeId);
+              if (!node) return;
+              for (const childId of node.children) {
+                  deleteRecursive(childId);
+              }
+              yNodes.delete(nodeId);
+          };
+          for (const childId of page.children) {
+              deleteRecursive(childId);
+          }
 
-  // Toast
+          yPages.delete(idx);
+
+          const state = get();
+          if (state.currentPageId === pageId) {
+               const newPage = yPages.get(0);
+               set({ currentPageId: newPage.id, selectedIds: new Set() });
+          }
+      });
+  },
+
   addToast: (message) =>
     set((state) => ({
       toasts: [
@@ -860,7 +956,43 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       toasts: state.toasts.filter((t) => t.id !== id),
     })),
 
-  // Persistence
+  importDocument: (json) => {
+      const { doc } = get();
+      if (!doc) return;
+
+      try {
+          const imported = JSON.parse(json);
+          doc.transact(() => {
+               const yNodes = doc.getMap<DesignNode>("nodes");
+               const yPages = doc.getArray<PageData>("pages");
+               const yMeta = doc.getMap<string>("meta");
+
+               // Clear existing
+               // yNodes.clear(); // Yjs doesn't have clear on Map? It does in newer versions or use keys
+               Array.from(yNodes.keys()).forEach(k => yNodes.delete(k));
+               yPages.delete(0, yPages.length);
+
+               if (imported.nodes) {
+                   for (const [k, v] of Object.entries(imported.nodes)) {
+                       yNodes.set(k, deepClone(v as DesignNode));
+                   }
+               }
+
+               if (Array.isArray(imported.pages) && imported.pages.length > 0) {
+                   yPages.push(deepClone(imported.pages));
+               } else {
+                   yPages.push([{ id: nanoid(), name: "Page 1", children: [] }]);
+               }
+
+               yMeta.set("name", imported.name || "Imported");
+          });
+
+          get().addToast("Document imported");
+      } catch (e) {
+          get().addToast("Failed to import document");
+      }
+  },
+
   exportDocument: () => {
     const state = get();
     const nodesObj: Record<string, DesignNode> = {};
@@ -881,34 +1013,6 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       null,
       2
     );
-  },
-
-  importDocument: (json) => {
-    try {
-      const doc = JSON.parse(json);
-      const nodesMap = new Map<string, DesignNode>();
-      if (doc.nodes) {
-        for (const [k, v] of Object.entries(doc.nodes)) {
-          nodesMap.set(k, deepClone(v as DesignNode));
-        }
-      }
-      const pages: PageData[] =
-        Array.isArray(doc.pages) && doc.pages.length > 0
-          ? deepClone(doc.pages)
-          : [{ id: nanoid(), name: "Page 1", children: [] }];
-
-      set({
-        nodes: nodesMap,
-        pages,
-        currentPageId: pages[0].id,
-        documentName: doc.name || "Imported",
-        selectedIds: new Set(),
-      });
-      get().pushHistory("Import document");
-      get().addToast("Document imported");
-    } catch {
-      get().addToast("Failed to import document");
-    }
   },
 
   // Helpers
@@ -946,4 +1050,5 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       .map((id) => state.nodes.get(id))
       .filter(Boolean) as DesignNode[];
   },
-}));
+})
+);

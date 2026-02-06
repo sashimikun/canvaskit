@@ -9,52 +9,9 @@ import LayersPanel from "./LayersPanel";
 import PropertiesPanel from "./PropertiesPanel";
 import Toasts from "./Toasts";
 import ShortcutHelp from "./ShortcutHelp";
+import Cursors from "./Cursors";
 import { fitImageToMaxWidth } from "../utils/imageSizing";
-
-const DB_NAME = "canvaskit";
-const STORE_NAME = "documents";
-const AUTOSAVE_ID = "autosave";
-
-function openEditorDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: "id" });
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function saveAutosaveDocument(data: string): Promise<void> {
-  const db = await openEditorDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    store.put({
-      id: AUTOSAVE_ID,
-      data,
-      timestamp: Date.now(),
-    });
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
-}
-
-async function loadAutosaveDocument(): Promise<string | null> {
-  const db = await openEditorDb();
-  return new Promise<string | null>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.get(AUTOSAVE_ID);
-    request.onsuccess = () => resolve(request.result?.data ?? null);
-    request.onerror = () => reject(request.error);
-  });
-}
+import { nanoid } from "nanoid";
 
 export default function Editor() {
   const showLeftPanel = useEditorStore((s) => s.showLeftPanel);
@@ -63,12 +20,19 @@ export default function Editor() {
   const camera = useEditorStore((s) => s.camera);
   const selectedIds = useEditorStore((s) => s.selectedIds);
   const nodes = useEditorStore((s) => s.nodes);
-  const pushHistory = useEditorStore((s) => s.pushHistory);
+  const initialize = useEditorStore((s) => s.initialize);
 
-  // Push initial history state
   useEffect(() => {
-    pushHistory("Initial state");
-  }, [pushHistory]);
+    const params = new URLSearchParams(window.location.search);
+    let roomId = params.get("room");
+    if (!roomId) {
+      roomId = nanoid(10);
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", roomId);
+      window.history.replaceState({}, "", url.toString());
+    }
+    initialize(roomId);
+  }, [initialize]);
 
   // ? key to toggle shortcut help
   useEffect(() => {
@@ -86,69 +50,6 @@ export default function Editor() {
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [showShortcuts]);
-
-  // Debounced auto-save to IndexedDB when document data changes
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let dirty = false;
-
-    const flushSave = () => {
-      if (!dirty) return;
-      dirty = false;
-      const json = useEditorStore.getState().exportDocument();
-      saveAutosaveDocument(json).catch(() => {
-        // no-op in demo mode
-      });
-    };
-
-    const unsubscribe = useEditorStore.subscribe((state, prev) => {
-      const changed =
-        state.nodes !== prev.nodes ||
-        state.pages !== prev.pages ||
-        state.documentName !== prev.documentName;
-      if (!changed) return;
-
-      dirty = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      timer = setTimeout(flushSave, 500);
-    });
-
-    // Flush save immediately on page unload so changes aren't lost
-    const handleBeforeUnload = () => {
-      if (timer) clearTimeout(timer);
-      flushSave();
-    };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-
-    return () => {
-      unsubscribe();
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      if (timer) clearTimeout(timer);
-      flushSave();
-    };
-  }, []);
-
-  // Load auto-save on mount
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const data = await loadAutosaveDocument();
-        if (!cancelled && data) {
-          const state = useEditorStore.getState();
-          state.importDocument(data);
-          state.addToast("Recovered auto-save");
-        }
-      } catch {
-        // no-op in demo mode
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Image drag-and-drop
   useEffect(() => {
@@ -215,31 +116,28 @@ export default function Editor() {
 
   return (
     <div className="h-screen w-screen flex flex-col bg-[#1a1a1a] overflow-hidden">
-      {/* Toolbar */}
       <Toolbar />
 
-      {/* Main area */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left panel */}
         {showLeftPanel && (
-          <div className="w-60 bg-[#252525] border-r border-white/[0.06] flex flex-col overflow-hidden">
+          <div className="w-60 bg-[#252525] border-r border-white/[0.06] flex flex-col overflow-hidden z-20">
             <LayersPanel />
           </div>
         )}
 
-        {/* Canvas */}
-        <Canvas />
+        <div className="flex-1 relative overflow-hidden bg-[#e5e5e5]">
+            <Canvas />
+            <Cursors />
+        </div>
 
-        {/* Right panel */}
         {showRightPanel && (
-          <div className="w-64 bg-[#252525] border-l border-white/[0.06] flex flex-col overflow-hidden">
+          <div className="w-64 bg-[#252525] border-l border-white/[0.06] flex flex-col overflow-hidden z-20">
             <PropertiesPanel />
           </div>
         )}
       </div>
 
-      {/* Status bar */}
-      <div className="h-7 bg-[#252525] border-t border-white/[0.06] flex items-center px-4 text-[10px] text-white/35 gap-4">
+      <div className="h-7 bg-[#252525] border-t border-white/[0.06] flex items-center px-4 text-[10px] text-white/35 gap-4 z-30">
         <span>
           {selectedIds.size > 0
             ? `${selectedIds.size} selected`
@@ -271,10 +169,8 @@ export default function Editor() {
         <span>Zoom: {Math.round(camera.zoom * 100)}%</span>
       </div>
 
-      {/* Toasts */}
       <Toasts />
 
-      {/* Shortcut help overlay */}
       {showShortcuts && <ShortcutHelp onClose={() => setShowShortcuts(false)} />}
     </div>
   );
