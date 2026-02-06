@@ -1,4 +1,4 @@
-import { DesignNode, SceneNode, TextNode, Camera, Paint, RGBA, SmartGuide, ImagePaint } from "../types";
+import { DesignNode, SceneNode, TextNode, PolygonNode, StarNode, Camera, Paint, RGBA, SmartGuide, ImagePaint } from "../types";
 
 // Image cache for rendering IMAGE fills
 const imageCache = new Map<string, HTMLImageElement>();
@@ -187,12 +187,13 @@ function drawStarPath(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
-  points = 5
+  points = 5,
+  innerRadius = 0.382
 ) {
   const cx = width / 2;
   const cy = height / 2;
   const outerR = Math.min(width, height) / 2;
-  const innerR = outerR * 0.45;
+  const innerR = outerR * innerRadius;
   ctx.beginPath();
   for (let i = 0; i < points * 2; i++) {
     const angle = -Math.PI / 2 + (i / (points * 2)) * Math.PI * 2;
@@ -336,7 +337,8 @@ export function renderNode(
     }
 
     case "POLYGON": {
-      drawPolygonPath(ctx, scene.width, scene.height);
+      const poly = node as PolygonNode;
+      drawPolygonPath(ctx, scene.width, scene.height, poly.sides);
       if (scene.fills.length > 0) {
         applyFill(ctx, scene.fills, scene);
         ctx.fill();
@@ -344,13 +346,14 @@ export function renderNode(
       ctx.shadowColor = "transparent";
       ctx.shadowBlur = 0;
       strokeAligned(ctx, scene, () => {
-        drawPolygonPath(ctx, scene.width, scene.height);
+        drawPolygonPath(ctx, scene.width, scene.height, poly.sides);
       });
       break;
     }
 
     case "STAR": {
-      drawStarPath(ctx, scene.width, scene.height);
+      const star = node as StarNode;
+      drawStarPath(ctx, scene.width, scene.height, star.points, star.innerRadius);
       if (scene.fills.length > 0) {
         applyFill(ctx, scene.fills, scene);
         ctx.fill();
@@ -358,7 +361,7 @@ export function renderNode(
       ctx.shadowColor = "transparent";
       ctx.shadowBlur = 0;
       strokeAligned(ctx, scene, () => {
-        drawStarPath(ctx, scene.width, scene.height);
+        drawStarPath(ctx, scene.width, scene.height, star.points, star.innerRadius);
       });
       break;
     }

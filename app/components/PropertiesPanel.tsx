@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { useEditorStore } from "../store";
-import { SceneNode, TextNode, RGBA, Paint, Effect } from "../types";
+import { SceneNode, TextNode, PolygonNode, StarNode, RGBA, Paint, Effect } from "../types";
 import ColorPicker from "./ColorPicker";
 import { renderNode as renderNodeFn } from "../utils/renderer";
 
@@ -744,6 +744,62 @@ function EffectsSection({ node }: { node: SceneNode }) {
   );
 }
 
+function PolygonSection({ node }: { node: PolygonNode }) {
+  const updateNode = useEditorStore((s) => s.updateNode);
+  const pushHistory = useEditorStore((s) => s.pushHistory);
+
+  return (
+    <div className="border-b border-white/[0.06] pb-4">
+      <span className="text-[11px] font-semibold text-white/50 block mb-3">
+        Polygon
+      </span>
+      <NumberInput
+        label="Sides"
+        value={node.sides}
+        onChange={(v) => {
+          updateNode(node.id, { sides: Math.max(3, Math.round(v)) } as Partial<PolygonNode>);
+          pushHistory("Change polygon sides");
+        }}
+        min={3}
+      />
+    </div>
+  );
+}
+
+function StarSection({ node }: { node: StarNode }) {
+  const updateNode = useEditorStore((s) => s.updateNode);
+  const pushHistory = useEditorStore((s) => s.pushHistory);
+
+  return (
+    <div className="border-b border-white/[0.06] pb-4">
+      <span className="text-[11px] font-semibold text-white/50 block mb-3">
+        Star
+      </span>
+      <div className="grid grid-cols-2 gap-2">
+        <NumberInput
+          label="Points"
+          value={node.points}
+          onChange={(v) => {
+            updateNode(node.id, { points: Math.max(3, Math.round(v)) } as Partial<StarNode>);
+            pushHistory("Change star points");
+          }}
+          min={3}
+        />
+        <NumberInput
+          label="Ratio %"
+          value={Math.round(node.innerRadius * 100)}
+          onChange={(v) => {
+            updateNode(node.id, { innerRadius: Math.max(0, Math.min(100, v)) / 100 } as Partial<StarNode>);
+            pushHistory("Change star inner radius");
+          }}
+          min={0}
+          max={100}
+        />
+      </div>
+    </div>
+  );
+}
+
 function TextSection({ node }: { node: TextNode }) {
   const updateNode = useEditorStore((s) => s.updateNode);
   const pushHistory = useEditorStore((s) => s.pushHistory);
@@ -904,6 +960,8 @@ export default function PropertiesPanel() {
   const node = selectedNodes[0];
   const isMulti = selectedNodes.length > 1;
   const isText = node.type === "TEXT";
+  const isPolygon = node.type === "POLYGON";
+  const isStar = node.type === "STAR";
 
   const handleTransformChange = (field: string, value: number) => {
     for (const n of selectedNodes) {
@@ -1009,6 +1067,10 @@ export default function PropertiesPanel() {
 
         {/* Effects */}
         <EffectsSection node={node} />
+
+        {/* Shape specific */}
+        {isPolygon && <PolygonSection node={node as PolygonNode} />}
+        {isStar && <StarSection node={node as StarNode} />}
 
         {/* Typography (text nodes only) */}
         {isText && <TextSection node={node as TextNode} />}

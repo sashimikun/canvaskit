@@ -57,9 +57,9 @@ function getParentWorldPosition(
 
 function createDefaultNode(
   type: DesignNode["type"],
-  overrides: Partial<SceneNode> = {}
-): SceneNode {
-  return {
+  overrides: Partial<DesignNode> = {}
+): DesignNode {
+  const base: any = {
     id: nanoid(),
     type,
     name: type.charAt(0) + type.slice(1).toLowerCase(),
@@ -84,6 +84,17 @@ function createDefaultNode(
     clipContent: false,
     ...overrides,
   };
+
+  if (type === "POLYGON" && base.sides === undefined) {
+    base.sides = 3;
+  }
+
+  if (type === "STAR") {
+    if (base.points === undefined) base.points = 5;
+    if (base.innerRadius === undefined) base.innerRadius = 0.382;
+  }
+
+  return base as DesignNode;
 }
 
 function createDefaultTextNode(overrides: Partial<TextNode> = {}): TextNode {
@@ -159,7 +170,7 @@ interface EditorState {
     y: number,
     width: number,
     height: number,
-    overrides?: Partial<SceneNode>
+    overrides?: Partial<DesignNode>
   ) => string;
   createTextNode: (x: number, y: number, overrides?: Partial<TextNode>) => string;
   duplicateNodes: (ids: string[]) => void;
