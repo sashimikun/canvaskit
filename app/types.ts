@@ -120,7 +120,18 @@ export interface TextNode extends SceneNode {
   textCase: "ORIGINAL" | "UPPER" | "LOWER" | "TITLE";
 }
 
-export type DesignNode = SceneNode | TextNode;
+export interface PolygonNode extends SceneNode {
+  type: "POLYGON";
+  sides: number;
+}
+
+export interface StarNode extends SceneNode {
+  type: "STAR";
+  points: number;
+  innerRadius: number;
+}
+
+export type DesignNode = SceneNode | TextNode | PolygonNode | StarNode;
 
 export type ToolType =
   | "SELECT"
